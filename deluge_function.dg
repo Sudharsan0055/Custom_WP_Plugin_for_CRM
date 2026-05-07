@@ -1,0 +1,84 @@
+string standalone.e2s2_universal_lead_bridge(Map formData)
+{
+// --------------------------------------------------------
+// 1. Extract fields using normalized snake_case keys
+//    (WordPress plugin sends labels as snake_case)
+// --------------------------------------------------------
+v_name = formData.get("name");
+v_phone = formData.get("phone");
+v_email = formData.get("email");
+v_dob = formData.get("dob");
+v_role = formData.get("role");
+v_qualification = formData.get("qualification_expected");
+v_placement = formData.get("placement_required");
+v_feedback = formData.get("candidate_feedback");
+v_course_name = formData.get("course_name");
+v_form_name = formData.get("_form_name");
+v_page_url = formData.get("_page_url");
+v_submitted_at = formData.get("_submitted_at");
+// --------------------------------------------------------
+// 2. Validate — Name or Email must be present
+// --------------------------------------------------------
+if(ifNull(v_name,"") == "" && ifNull(v_email,"") == "")
+{
+    return "Error: Name and Email are both missing. Submission rejected.";
+}
+// --------------------------------------------------------
+// 3. Derive Lead Source from course_name or page_url
+//    e.g. "/courses/photography/" → "Photography"
+// --------------------------------------------------------
+v_lead_source_raw = ifNull(v_course_name,ifNull(v_page_url,"tatti.e2s2.in"));
+// Clean up the course path to a readable name
+// Remove leading/trailing slashes, split by "/", get last meaningful part
+v_course_clean = v_lead_source_raw.replaceAll("/courses/","").replaceAll("/","").trim();
+v_course_display = if(v_course_clean != "",v_course_clean,"Website");
+// --------------------------------------------------------
+// 4. Build Lead record map
+// --------------------------------------------------------
+leadMap = Map();
+// Core fields
+leadMap.put("Last_Name",ifNull(v_name,"Website Lead"));
+leadMap.put("Email",ifNull(v_email,""));
+leadMap.put("Phone",ifNull(v_phone,""));
+leadMap.put("Lead_Source","tatti.e2s2.in");
+// Course-specific fields
+leadMap.put("Description",ifNull(v_course_name,"") + " | Form: " + ifNull(v_form_name,"") + " | Feedback: " + ifNull(v_feedback,""));
+// Custom fields — make sure these field API names exist in your Zoho CRM Lead module
+// If they don't exist yet, create them in CRM → Settings → Fields
+leadMap.put("Date_of_Birth",ifNull(v_dob,""));
+leadMap.put("Role1",ifNull(v_role,""));
+leadMap.put("Qualification_Expected",ifNull(v_qualification,""));
+leadMap.put("Placement_Required",ifNull(v_placement,""));
+leadMap.put("Course_Interested",ifNull(v_course_name,""));
+leadMap.put("Source_Page_URL",ifNull(v_page_url,""));
+leadMap.put("Form_Name",ifNull(v_form_name,""));
+// --------------------------------------------------------
+// 5. Check for duplicate lead by Email before creating
+// --------------------------------------------------------
+v_existing_leads = zoho.crm.searchRecords("Leads","Email:equals:" + ifNull(v_email,"NOEMAIL"));
+if(v_existing_leads.size() > 0 && ifNull(v_email,"") != "")
+{
+    // Update existing lead instead of creating duplicate
+    v_existing_id = v_existing_leads.get(0).get("id");
+    // Add note about new form submission
+    noteMap = Map();
+    noteMap.put("Note_Title","New Inquiry - " + ifNull(v_form_name,"Form"));
+    noteMap.put("Note_Content","Re-inquiry via: " + ifNull(v_course_name,v_page_url) + " on " + ifNull(v_submitted_at,""));
+    noteMap.put("Parent_Id",v_existing_id);
+    noteMap.put("se_module","Leads");
+    zoho.crm.createRecord("Notes",noteMap);
+    return "Updated: Lead already exists with ID " + v_existing_id + ". Note added.";
+}
+// --------------------------------------------------------
+// 6. Create new Lead record
+// --------------------------------------------------------
+response = zoho.crm.createRecord("Leads",leadMap);
+if(response.get("id") != null)
+{
+    return "Success: Lead created with ID " + response.get("id") + " for " + ifNull(v_name,"Unknown") + " | Course: " + ifNull(v_course_name,"N/A");
+}
+else
+{
+    return "Error: Lead creation failed. Response: " + response.toString();
+}
+}
