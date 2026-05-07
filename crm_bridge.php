@@ -4,7 +4,7 @@ Copy
 /**
  * Plugin Name: E2S2 CRM Bridge
  * Description: Dynamically captures all Elementor form submissions and sends them to Zoho CRM and/or Salesforce CRM. Includes submission logs, admin settings, test connection, and retry.
- * Version: 3.1
+ * Version: 3.2
  * Author: Sudharsan
  */
 
@@ -47,7 +47,6 @@ function e2s2_maybe_upgrade_table()
     global $wpdb;
     $table = $wpdb->prefix . 'e2s2_crm_logs';
 
-    // Table might not exist yet (pre-activation state) — bail safely
     $exists = $wpdb->get_var("SHOW TABLES LIKE '$table'");
     if (!$exists)
         return;
@@ -99,11 +98,13 @@ function e2s2_register_settings()
         'e2s2_sf_username',
         'e2s2_sf_password',
         'e2s2_sf_security_token',
-        'e2s2_sf_instance_url',
+        'e2s2_sf_login_url',  // v3.2: renamed from e2s2_sf_instance_url — stores login endpoint only
     ];
     foreach ($fields as $f) {
         register_setting('e2s2-settings-group', $f);
     }
+    // Also keep the old key registered so it doesn't get orphaned in wp_options
+    register_setting('e2s2-settings-group', 'e2s2_sf_instance_url');
 }
 
 // ============================================================
@@ -125,8 +126,12 @@ function e2s2_ajax_test_sf()
         wp_send_json_error(['message' => $token->get_error_message()]);
     }
 
-    // Try a lightweight describe call to verify token + permissions
+    // Use the cached instance URL (set by token function after successful auth)
     $instance_url = rtrim(get_option('e2s2_sf_instance_url', ''), '/');
+    if (empty($instance_url)) {
+        wp_send_json_error(['message' => 'Instance URL missing after token fetch — please re-save settings and try again.']);
+    }
+
     $resp = wp_remote_get($instance_url . '/services/data/v59.0/sobjects/Lead/describe/', [
         'timeout' => 15,
         'headers' => [
@@ -144,7 +149,7 @@ function e2s2_ajax_test_sf()
         $body = json_decode(wp_remote_retrieve_body($resp), true);
         $field_count = isset($body['fields']) ? count($body['fields']) : '?';
         wp_send_json_success([
-            'message' => '✅ Connected successfully! Lead object has ' . $field_count . ' fields.',
+            'message' => '✅ Connected! Lead object has ' . $field_count . ' fields. Instance: ' . $instance_url,
             'instance' => $instance_url,
         ]);
     } else {
@@ -163,7 +168,7 @@ function e2s2_ajax_retry()
         wp_die('Unauthorized');
 
     $id = (int) $_POST['log_id'];
-    $crm = sanitize_text_field($_POST['crm']); // 'zoho' or 'sf'
+    $crm = sanitize_text_field($_POST['crm']);
 
     global $wpdb;
     $table = $wpdb->prefix . 'e2s2_crm_logs';
@@ -178,7 +183,6 @@ function e2s2_ajax_retry()
         wp_send_json_error(['message' => 'Payload could not be decoded.']);
     }
 
-    // Increment retry counter
     $wpdb->update($table, ['retry_count' => (int) $log->retry_count + 1], ['id' => $id]);
 
     if ($crm === 'zoho') {
@@ -211,7 +215,9 @@ function e2s2_settings_page()
     $sf_username = get_option('e2s2_sf_username', '');
     $sf_password = get_option('e2s2_sf_password', '');
     $sf_security_token = get_option('e2s2_sf_security_token', '');
-    $sf_instance_url = get_option('e2s2_sf_instance_url', 'https://login.salesforce.com');
+    // v3.2: e2s2_sf_login_url stores only the login endpoint (login.salesforce.com or test.salesforce.com)
+    // e2s2_sf_instance_url is auto-populated after first successful auth and used for API calls
+    $sf_login_url = get_option('e2s2_sf_login_url', 'https://login.salesforce.com');
 
     global $wpdb;
     $table = $wpdb->prefix . 'e2s2_crm_logs';
@@ -501,10 +507,36 @@ function e2s2_settings_page()
             border-radius: 4px;
             font-family: 'DM Mono', monospace;
         }
+
+        .instance-url-row {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 12px;
+            color: #475569;
+            margin-top: 4px;
+            font-family: 'DM Mono', monospace;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .instance-url-row span.label {
+            font-family: 'DM Sans', sans-serif;
+            font-weight: 600;
+            color: #374151;
+            white-space: nowrap;
+        }
+
+        .instance-url-row span.val {
+            color: #6366f1;
+            word-break: break-all;
+        }
     </style>
 
     <div id="e2s2-wrap">
-        <h1>⚡ E2S2 CRM Bridge <span class="badge">v3.1</span></h1>
+        <h1>⚡ E2S2 CRM Bridge <span class="badge">v3.2</span></h1>
         <p style="color:#64748b;margin-bottom:24px;font-size:13px;">
             Captures all Elementor form submissions → routes to <strong>Zoho CRM</strong> and/or <strong>Salesforce
                 CRM</strong>.
@@ -515,33 +547,23 @@ function e2s2_settings_page()
             <h2>📊 Submission Overview</h2>
             <div class="e2s2-stats">
                 <div class="e2s2-stat">
-                    <div class="num">
-                        <?php echo $total; ?>
-                    </div>
+                    <div class="num"><?php echo $total; ?></div>
                     <div class="lbl">Total</div>
                 </div>
                 <div class="e2s2-stat">
-                    <div class="num" style="color:#ff6a00">
-                        <?php echo $z_ok; ?>
-                    </div>
+                    <div class="num" style="color:#ff6a00"><?php echo $z_ok; ?></div>
                     <div class="lbl">Zoho ✓</div>
                 </div>
                 <div class="e2s2-stat">
-                    <div class="num" style="color:#ef4444">
-                        <?php echo $z_fail; ?>
-                    </div>
+                    <div class="num" style="color:#ef4444"><?php echo $z_fail; ?></div>
                     <div class="lbl">Zoho ✗</div>
                 </div>
                 <div class="e2s2-stat">
-                    <div class="num" style="color:#00A1E0">
-                        <?php echo $sf_ok; ?>
-                    </div>
+                    <div class="num" style="color:#00A1E0"><?php echo $sf_ok; ?></div>
                     <div class="lbl">Salesforce ✓</div>
                 </div>
                 <div class="e2s2-stat">
-                    <div class="num" style="color:#ef4444">
-                        <?php echo $sf_fail; ?>
-                    </div>
+                    <div class="num" style="color:#ef4444"><?php echo $sf_fail; ?></div>
                     <div class="lbl">Salesforce ✗</div>
                 </div>
             </div>
@@ -578,10 +600,12 @@ function e2s2_settings_page()
             <div class="e2s2-card sf-card">
                 <h2>🔵 Salesforce CRM Connection <span class="crm-pill pill-sf">SALESFORCE</span></h2>
                 <p style="font-size:12px;color:#64748b;margin-bottom:18px;">
-                    Uses a <strong>Connected App</strong> with OAuth2 Username–Password flow to POST Leads directly via the
-                    Salesforce REST API.
-                    <a href="https://help.salesforce.com/s/articleView?id=sf.connected_app_create.htm" target="_blank"
-                        style="color:#00A1E0;">How to create a Connected App →</a>
+                    Uses an <strong>External Client App</strong> (Salesforce Spring '26+) with OAuth2 Username–Password flow
+                    to POST Leads directly via the Salesforce REST API.
+                    Requires a paid Salesforce plan (Essentials or above) — the Starter trial does not support API
+                    integrations.
+                    <a href="https://help.salesforce.com/s/articleView?id=xcloud.connected_app_create.htm" target="_blank"
+                        style="color:#00A1E0;">How to create an External Client App →</a>
                 </p>
 
                 <div class="e2s2-field">
@@ -596,13 +620,13 @@ function e2s2_settings_page()
                         <label>Consumer Key (Client ID) <span style="color:#ef4444">*</span></label>
                         <input type="text" name="e2s2_sf_client_id" value="<?php echo esc_attr($sf_client_id); ?>"
                             placeholder="3MVG9..." />
-                        <div class="hint">Connected App → Manage Consumer Details</div>
+                        <div class="hint">External Client App → Consumer Key / Client ID</div>
                     </div>
                     <div class="e2s2-field">
                         <label>Consumer Secret (Client Secret) <span style="color:#ef4444">*</span></label>
                         <input type="password" name="e2s2_sf_client_secret"
                             value="<?php echo esc_attr($sf_client_secret); ?>" placeholder="••••••••" />
-                        <div class="hint">Shown once in Connected App — save it immediately</div>
+                        <div class="hint">Shown once — copy it immediately when created</div>
                     </div>
                     <div class="e2s2-field">
                         <label>Salesforce Username <span style="color:#ef4444">*</span></label>
@@ -621,18 +645,30 @@ function e2s2_settings_page()
                         <input type="password" name="e2s2_sf_security_token"
                             value="<?php echo esc_attr($sf_security_token); ?>"
                             placeholder="Token from Salesforce profile email" />
-                        <div class="hint">Profile icon → Settings → Reset My Security Token (emailed to you)</div>
+                        <div class="hint">Profile icon → Settings → Reset My Security Token (emailed to you). Leave blank if
+                            IP Relaxation is set to "Relax IP restrictions" in your app policies.</div>
                     </div>
                     <div class="e2s2-field">
-                        <label>Login / Instance URL</label>
-                        <input type="text" name="e2s2_sf_instance_url" value="<?php echo esc_attr($sf_instance_url); ?>"
+                        <label>Login URL</label>
+                        <input type="text" name="e2s2_sf_login_url" value="<?php echo esc_attr($sf_login_url); ?>"
                             placeholder="https://login.salesforce.com" />
-                        <div class="hint">Use <code>https://test.salesforce.com</code> for sandbox orgs</div>
+                        <div class="hint">Use <code>https://test.salesforce.com</code> for sandbox orgs only. After first
+                            successful login the plugin auto-detects your instance URL.</div>
                     </div>
                 </div>
 
+                <?php
+                // Show the auto-detected instance URL if we have one
+                $cached_instance = get_option('e2s2_sf_instance_url', '');
+                if ($cached_instance && $cached_instance !== 'https://login.salesforce.com'): ?>
+                    <div class="instance-url-row">
+                        <span class="label">Auto-detected instance:</span>
+                        <span class="val"><?php echo esc_html($cached_instance); ?></span>
+                    </div>
+                <?php endif; ?>
+
                 <!-- Test Connection -->
-                <div style="margin-top:4px;">
+                <div style="margin-top:16px;">
                     <button type="button" class="e2s2-btn-sf" id="sf-test-btn" onclick="e2s2TestSF()">
                         🔌 Test Salesforce Connection
                     </button>
@@ -642,12 +678,14 @@ function e2s2_settings_page()
                 </div>
 
                 <div class="info-box" style="margin-top:16px;">
-                    <strong>🔐 How authentication works:</strong><br>
-                    The plugin exchanges your credentials for a short-lived OAuth Bearer token via Salesforce's token
-                    endpoint.
-                    The token is cached in <code>wp_options</code> for 50 minutes and auto-refreshed.
-                    Your password is stored in the WordPress database (same as all plugin settings) — use a dedicated
-                    integration user account for best security.
+                    <strong>🔐 How authentication works (v3.2):</strong><br>
+                    The plugin exchanges your credentials for an OAuth Bearer token via Salesforce's token endpoint
+                    (<code>login.salesforce.com</code>).
+                    The token is cached in <code>wp_options</code> for 50 minutes and auto-refreshed on expiry.
+                    Salesforce also returns your org's unique instance URL (e.g. <code>yourorg.my.salesforce.com</code>) —
+                    this is saved automatically and used for all API calls.
+                    Your password is stored in the WordPress database — use a dedicated integration user account for best
+                    security.
                 </div>
             </div>
 
@@ -770,22 +808,25 @@ function e2s2_settings_page()
 
         <!-- How it works -->
         <div class="e2s2-card" style="background:#fffbeb;border-color:#fde68a;">
-            <h2 style="border-color:#fde68a;">📋 How This Works (v3.1)</h2>
+            <h2 style="border-color:#fde68a;">📋 How This Works (v3.2)</h2>
             <ol style="font-size:13px;color:#374151;line-height:1.9;margin:0;padding-left:18px;">
                 <li>Hooks into <strong>all Elementor forms</strong> automatically — zero per-form configuration needed.</li>
                 <li>Each submission is <strong>logged immediately</strong> in the database with a <code>pending</code>
                     status for both CRMs.</li>
-                <li>If <strong>Zoho</strong> is enabled → calls your Deluge function via REST URL (same as v2.0 —
-                    unchanged).</li>
-                <li>If <strong>Salesforce</strong> is enabled → fetches OAuth2 token once, caches it 50 min, then POSTs a
-                    Lead via REST API. Duplicate emails → updates existing Lead + adds a note.</li>
+                <li>If <strong>Zoho</strong> is enabled → calls your Deluge function via REST URL (unchanged from v2.0).
+                </li>
+                <li>If <strong>Salesforce</strong> is enabled → fetches OAuth2 token using Login URL, then uses the
+                    auto-detected instance URL for all API calls. Caches token for 50 min. Duplicate emails → adds a Task to
+                    the existing Lead instead of creating a duplicate.</li>
                 <li>Both CRMs run <strong>simultaneously</strong> — one submission → two CRMs, each logged independently.
                 </li>
-                <li>Use the <strong>Test Connection</strong> button to verify Salesforce credentials before going live.</li>
-                <li>Failed submissions can be <strong>retried individually</strong> from the Logs page — no need to resubmit
-                    the form.</li>
+                <li>Use <strong>Test Connection</strong> to verify Salesforce credentials before going live. Errors show the
+                    exact Salesforce reason.</li>
+                <li>Failed submissions can be <strong>retried individually</strong> from the Logs page.</li>
                 <li>Check <a href="<?php echo admin_url('admin.php?page=e2s2-crm-logs'); ?>">Submission Logs</a> for
                     real-time per-CRM status and error details.</li>
+                <li><strong>Salesforce requirement:</strong> Requires Essentials plan or above. Starter trial does not
+                    support API/OAuth integrations.</li>
             </ol>
         </div>
     </div>
@@ -840,18 +881,15 @@ function e2s2_logs_page()
     global $wpdb;
     $table = $wpdb->prefix . 'e2s2_crm_logs';
 
-    // Handle clear all
     if (isset($_POST['e2s2_clear_logs']) && check_admin_referer('e2s2_clear_logs_nonce')) {
         $wpdb->query("TRUNCATE TABLE $table");
         echo '<div class="notice notice-success"><p>All logs cleared.</p></div>';
     }
 
-    // Pagination
     $per_page = 20;
     $current_page = max(1, isset($_GET['paged']) ? (int) $_GET['paged'] : 1);
     $offset = ($current_page - 1) * $per_page;
 
-    // Filter
     $filter_status = isset($_GET['status']) ? sanitize_text_field($_GET['status']) : '';
     $where = '';
     if ($filter_status === 'zoho_success')
@@ -1102,8 +1140,7 @@ function e2s2_logs_page()
         <div class="e2s2-toolbar">
             <div class="e2s2-filters">
                 <a href="?page=e2s2-crm-logs" class="<?php echo !$filter_status ? 'active' : ''; ?>">
-                    All (
-                    <?php echo $total_items; ?>)
+                    All (<?php echo $total_items; ?>)
                 </a>
                 <a href="?page=e2s2-crm-logs&status=zoho_success"
                     class="zoho-filter <?php echo $filter_status === 'zoho_success' ? 'active' : ''; ?>">🟠 Zoho ✓</a>
@@ -1147,63 +1184,44 @@ function e2s2_logs_page()
                         $s_class = $log->sf_status === 'success' ? 'bs-ok' : ($log->sf_status === 'failed' ? 'bs-fail' : ($log->sf_status === 'skipped' ? 'bs-skip' : 'bs-pend'));
                         ?>
                         <tr id="log-row-<?php echo $log->id; ?>">
-                            <td class="mono">
-                                <?php echo esc_html($log->id); ?>
-                            </td>
+                            <td class="mono"><?php echo esc_html($log->id); ?></td>
                             <td style="white-space:nowrap;color:#64748b;font-size:11px;">
                                 <?php echo esc_html(date('d M Y', strtotime($log->submitted_at))); ?><br>
-                                <span style="color:#94a3b8">
-                                    <?php echo esc_html(date('h:i A', strtotime($log->submitted_at))); ?>
-                                </span>
+                                <span
+                                    style="color:#94a3b8"><?php echo esc_html(date('h:i A', strtotime($log->submitted_at))); ?></span>
                             </td>
-                            <td><strong>
-                                    <?php echo esc_html($log->form_name ?: '—'); ?>
-                                </strong></td>
-                            <td class="mono" style="font-size:11px;">
-                                <?php echo esc_html($log->course_name ?: '—'); ?>
-                            </td>
-
-                            <!-- Zoho status cell -->
+                            <td><strong><?php echo esc_html($log->form_name ?: '—'); ?></strong></td>
+                            <td class="mono" style="font-size:11px;"><?php echo esc_html($log->course_name ?: '—'); ?></td>
                             <td>
-                                <span class="bs <?php echo $z_class; ?>" id="zoho-badge-<?php echo $log->id; ?>">
-                                    <?php echo strtoupper($log->zoho_status ?: 'pending'); ?>
-                                </span>
+                                <span class="bs <?php echo $z_class; ?>"
+                                    id="zoho-badge-<?php echo $log->id; ?>"><?php echo strtoupper($log->zoho_status ?: 'pending'); ?></span>
                                 <?php if ($log->zoho_status === 'failed' && $log->zoho_response): ?>
                                     <div style="font-size:10px;color:#ef4444;margin-top:3px;">
-                                        <?php echo esc_html(substr($log->zoho_response, 0, 80)); ?>
-                                    </div>
+                                        <?php echo esc_html(substr($log->zoho_response, 0, 80)); ?></div>
                                 <?php endif; ?>
                                 <?php if ($log->zoho_status === 'failed'): ?>
                                     <button class="retry-btn" id="retry-zoho-<?php echo $log->id; ?>"
                                         onclick="e2s2Retry(<?php echo $log->id; ?>, 'zoho', this)">↺ Retry Zoho</button>
                                 <?php endif; ?>
                             </td>
-
-                            <!-- Salesforce status cell -->
                             <td>
-                                <span class="bs <?php echo $s_class; ?>" id="sf-badge-<?php echo $log->id; ?>">
-                                    <?php echo strtoupper($log->sf_status ?: 'pending'); ?>
-                                </span>
+                                <span class="bs <?php echo $s_class; ?>"
+                                    id="sf-badge-<?php echo $log->id; ?>"><?php echo strtoupper($log->sf_status ?: 'pending'); ?></span>
                                 <?php if ($log->sf_status === 'failed' && $log->sf_response): ?>
                                     <div style="font-size:10px;color:#ef4444;margin-top:3px;">
-                                        <?php echo esc_html(substr($log->sf_response, 0, 80)); ?>
-                                    </div>
+                                        <?php echo esc_html(substr($log->sf_response, 0, 80)); ?></div>
                                 <?php endif; ?>
                                 <?php if ($log->sf_status === 'failed'): ?>
                                     <button class="retry-btn" id="retry-sf-<?php echo $log->id; ?>"
                                         onclick="e2s2Retry(<?php echo $log->id; ?>, 'sf', this)">↺ Retry SF</button>
                                 <?php endif; ?>
                             </td>
-
-                            <td class="retry-count">
-                                <?php echo (int) $log->retry_count > 0 ? (int) $log->retry_count . 'x' : '—'; ?>
+                            <td class="retry-count"><?php echo (int) $log->retry_count > 0 ? (int) $log->retry_count . 'x' : '—'; ?>
                             </td>
-
                             <td>
                                 <button class="payload-toggle" onclick="togglePayload(<?php echo $log->id; ?>)">View data</button>
                                 <div class="payload-box" id="payload-<?php echo $log->id; ?>">
-                                    <?php echo esc_html($payload_pretty); ?>
-                                </div>
+                                    <?php echo esc_html($payload_pretty); ?></div>
                             </td>
                         </tr>
                     <?php endforeach; ?>
@@ -1214,9 +1232,7 @@ function e2s2_logs_page()
                 <div class="e2s2-pagination">
                     <?php for ($i = 1; $i <= $total_pages; $i++): ?>
                         <?php if ($i === $current_page): ?>
-                            <span class="current">
-                                <?php echo $i; ?>
-                            </span>
+                            <span class="current"><?php echo $i; ?></span>
                         <?php else: ?>
                             <a
                                 href="?page=e2s2-crm-logs&paged=<?php echo $i; ?><?php echo $filter_status ? '&status=' . $filter_status : ''; ?>">
@@ -1294,7 +1310,6 @@ function e2s2_handle_elementor_form($record, $handler)
     $zoho_url = get_option('e2s2_zoho_url', '');
     $sf_enabled = get_option('e2s2_sf_enabled', '0');
 
-    // Build form data map from all field labels → snake_case keys
     $form_data = [];
     $course_name = '';
     $raw_fields = $record->get('fields');
@@ -1312,7 +1327,6 @@ function e2s2_handle_elementor_form($record, $handler)
         }
     }
 
-    // Metadata
     $form_name = $record->get_form_settings('form_name') ?: 'Unknown Form';
     $page_url = isset($_SERVER['HTTP_REFERER']) ? esc_url_raw($_SERVER['HTTP_REFERER']) : '';
 
@@ -1320,7 +1334,6 @@ function e2s2_handle_elementor_form($record, $handler)
     $form_data['_page_url'] = $page_url;
     $form_data['_submitted_at'] = current_time('Y-m-d H:i:s');
 
-    // Insert log row immediately
     global $wpdb;
     $table = $wpdb->prefix . 'e2s2_crm_logs';
 
@@ -1336,7 +1349,6 @@ function e2s2_handle_elementor_form($record, $handler)
     ]);
     $log_id = $wpdb->insert_id;
 
-    // Dispatch to CRMs
     if ($zoho_enabled && !empty($zoho_url)) {
         e2s2_send_to_zoho($zoho_url, $form_data, $log_id);
     }
@@ -1379,14 +1391,13 @@ function e2s2_send_to_zoho($zoho_url, $form_data, $log_id)
 }
 
 // ============================================================
-// 11. SALESFORCE — Get OAuth2 Token (cached, auto-refresh)
+// 11. SALESFORCE — Get OAuth2 Token (v3.2 — fixed URL handling)
 // ============================================================
 function e2s2_get_sf_token()
 {
     $cached_token = get_option('e2s2_sf_access_token', '');
     $token_expiry = (int) get_option('e2s2_sf_token_expiry', 0);
 
-    // Return cached token if still valid (50-min window)
     if ($cached_token && time() < $token_expiry) {
         return $cached_token;
     }
@@ -1396,57 +1407,123 @@ function e2s2_get_sf_token()
     $username = get_option('e2s2_sf_username', '');
     $password = get_option('e2s2_sf_password', '');
     $security_token = get_option('e2s2_sf_security_token', '');
-    $instance_url = rtrim(get_option('e2s2_sf_instance_url', 'https://login.salesforce.com'), '/');
 
-    if (!$client_id || !$client_secret || !$username || !$password) {
-        return new WP_Error('sf_config', 'Salesforce credentials incomplete. Check plugin settings.');
+    // ── v3.2 FIX: Use dedicated login URL for token requests only ──────────────
+    // e2s2_sf_login_url = always login.salesforce.com or test.salesforce.com
+    // e2s2_sf_instance_url = auto-populated after auth, used for all API calls
+    // In v3.1 these were the same option which caused login to break after first
+    // successful auth (instance URL like yourorg.my.salesforce.com was saved back
+    // into the login URL field, and while SF does accept token requests on instance
+    // URLs it caused confusion and settings-page display issues).
+    $login_url = rtrim(get_option('e2s2_sf_login_url', 'https://login.salesforce.com'), '/');
+
+    // Fallback: if only the old option exists (upgrading from v3.1), use it
+    if (empty($login_url) || $login_url === 'https://login.salesforce.com') {
+        $old = rtrim(get_option('e2s2_sf_instance_url', ''), '/');
+        if ($old && strpos($old, 'login.salesforce.com') !== false) {
+            $login_url = $old;
+        } elseif ($old && strpos($old, 'test.salesforce.com') !== false) {
+            $login_url = $old;
+        }
+        // If old value is an instance URL (e.g. .my.salesforce.com), ignore it
+        // and fall back to the default login endpoint
     }
 
-    $response = wp_remote_post($instance_url . '/services/oauth2/token', [
+    if (!$client_id || !$client_secret || !$username || !$password) {
+        return new WP_Error('sf_config', 'Salesforce credentials are incomplete. Please fill all required fields in CRM Bridge → Settings.');
+    }
+
+    $response = wp_remote_post($login_url . '/services/oauth2/token', [
         'timeout' => 30,
         'body' => [
             'grant_type' => 'password',
             'client_id' => $client_id,
             'client_secret' => $client_secret,
             'username' => $username,
-            // Salesforce requires password and security token concatenated
-            'password' => $password . $security_token,
+            'password' => $password . $security_token, // SF requires these concatenated
         ],
     ]);
 
     if (is_wp_error($response)) {
-        return new WP_Error('sf_http', 'Token request failed: ' . $response->get_error_message());
+        return new WP_Error('sf_http', 'Could not reach Salesforce: ' . $response->get_error_message());
     }
 
     $body = json_decode(wp_remote_retrieve_body($response), true);
     $code = wp_remote_retrieve_response_code($response);
+    $raw = wp_remote_retrieve_body($response);
 
     if (empty($body['access_token'])) {
-        $err = isset($body['error_description']) ? $body['error_description'] : wp_remote_retrieve_body($response);
-        return new WP_Error('sf_token', 'Token error (' . $code . '): ' . $err);
+        $sf_error = isset($body['error']) ? $body['error'] : 'unknown_error';
+        $sf_desc = isset($body['error_description']) ? $body['error_description'] : $raw;
+
+        error_log('[E2S2 CRM Bridge] SF token error — ' . $sf_error . ': ' . $sf_desc);
+
+        // Actionable error messages for the most common failure reasons
+        if ($sf_error === 'unsupported_grant_type' || strpos($sf_desc, 'grant type not supported') !== false) {
+            return new WP_Error(
+                'sf_token',
+                'Username-Password OAuth flow is disabled on this Salesforce org. ' .
+                'Fix: Setup → App Manager → your app → Manage → Edit Policies → ' .
+                'set "Permitted Users" to "All users may self-authorize" AND ' .
+                '"IP Relaxation" to "Relax IP restrictions". Save and wait 2 minutes. ' .
+                'Note: Requires Essentials plan or above — Starter trial does not support this.'
+            );
+        }
+        if ($sf_error === 'invalid_client_id' || strpos($sf_desc, 'client identifier invalid') !== false) {
+            return new WP_Error(
+                'sf_token',
+                'Consumer Key (Client ID) is invalid. ' .
+                'Check: App Manager → your app → Manage Consumer Details. The key starts with 3MVG.'
+            );
+        }
+        if ($sf_error === 'invalid_client' || strpos($sf_desc, 'client secret invalid') !== false) {
+            return new WP_Error(
+                'sf_token',
+                'Consumer Secret is invalid. ' .
+                'Regenerate: App Manager → your app → Manage Consumer Details → Regenerate.'
+            );
+        }
+        if (strpos($sf_desc, 'authentication failure') !== false || strpos($sf_desc, 'INVALID_LOGIN') !== false) {
+            return new WP_Error(
+                'sf_token',
+                'Login failed — wrong username, password, or security token. ' .
+                'The plugin appends your security token to the password automatically — do not add it manually. ' .
+                'Get a fresh token: Profile avatar → Settings → Reset My Security Token.'
+            );
+        }
+        if (strpos($sf_desc, 'ip restricted') !== false || strpos($sf_desc, 'TrustedIP') !== false) {
+            return new WP_Error(
+                'sf_token',
+                'Your server IP is blocked by Salesforce. ' .
+                'Fix: App Manager → your app → Manage → Edit Policies → IP Relaxation → "Relax IP restrictions".'
+            );
+        }
+
+        return new WP_Error('sf_token', 'Salesforce error (' . $code . '): ' . $sf_desc);
     }
 
-    // Cache for 50 minutes (Salesforce tokens are valid for ~2 hours)
+    // Cache token for 50 minutes
     update_option('e2s2_sf_access_token', $body['access_token']);
     update_option('e2s2_sf_token_expiry', time() + 3000);
 
-    // Salesforce returns the actual instance URL — always use this one for API calls
+    // ── v3.2 FIX: Save instance URL separately — never overwrite the login URL ─
+    // Salesforce returns the org-specific API base URL here (e.g. yourorg.my.salesforce.com)
+    // All API calls (create Lead, SOQL query, etc.) MUST use this URL, not login.salesforce.com
     if (!empty($body['instance_url'])) {
-        update_option('e2s2_sf_instance_url', $body['instance_url']);
+        update_option('e2s2_sf_instance_url', rtrim($body['instance_url'], '/'));
     }
 
     return $body['access_token'];
 }
 
 // ============================================================
-// 12. SEND TO SALESFORCE — with duplicate check
+// 12. SEND TO SALESFORCE — with duplicate check (unchanged logic)
 // ============================================================
 function e2s2_send_to_salesforce($form_data, $log_id)
 {
     global $wpdb;
     $table = $wpdb->prefix . 'e2s2_crm_logs';
 
-    // Get token
     $access_token = e2s2_get_sf_token();
     if (is_wp_error($access_token)) {
         $wpdb->update($table, [
@@ -1456,9 +1533,16 @@ function e2s2_send_to_salesforce($form_data, $log_id)
         return;
     }
 
+    // Always use the instance URL for API calls (set by e2s2_get_sf_token above)
     $instance_url = rtrim(get_option('e2s2_sf_instance_url', ''), '/');
+    if (empty($instance_url)) {
+        $wpdb->update($table, [
+            'sf_status' => 'failed',
+            'sf_response' => 'Instance URL not set — please click Test Connection once to auto-detect it.',
+        ], ['id' => $log_id]);
+        return;
+    }
 
-    // ── Extract form fields ────────────────────────────────────────────────────
     $v_name = isset($form_data['name']) ? $form_data['name'] : '';
     $v_email = isset($form_data['email']) ? $form_data['email'] : '';
     $v_phone = isset($form_data['phone']) ? $form_data['phone'] : '';
@@ -1472,12 +1556,10 @@ function e2s2_send_to_salesforce($form_data, $log_id)
     $v_page_url = isset($form_data['_page_url']) ? $form_data['_page_url'] : '';
     $v_submitted = isset($form_data['_submitted_at']) ? $form_data['_submitted_at'] : '';
 
-    // Split full name → FirstName + LastName (SF requires LastName)
     $name_parts = explode(' ', trim($v_name), 2);
     $first_name = count($name_parts) > 1 ? $name_parts[0] : '';
     $last_name = count($name_parts) > 1 ? $name_parts[1] : ($name_parts[0] ?: 'Website Lead');
 
-    // Build description from available context
     $desc_parts = array_filter([
         $v_course ? 'Course: ' . $v_course : '',
         $v_form_name ? 'Form: ' . $v_form_name : '',
@@ -1489,12 +1571,10 @@ function e2s2_send_to_salesforce($form_data, $log_id)
     ]);
     $description = implode(' | ', $desc_parts);
 
-    // ── Duplicate check by email ───────────────────────────────────────────────
+    // Duplicate check by email
     if (!empty($v_email)) {
-        $email_encoded = urlencode("Email='" . addslashes($v_email) . "'");
         $search_url = $instance_url . '/services/data/v59.0/query/?q=' .
             urlencode("SELECT Id, Name FROM Lead WHERE Email = '" . addslashes($v_email) . "' AND IsConverted = false LIMIT 1");
-
         $search_resp = wp_remote_get($search_url, [
             'timeout' => 15,
             'headers' => [
@@ -1506,7 +1586,6 @@ function e2s2_send_to_salesforce($form_data, $log_id)
         if (!is_wp_error($search_resp)) {
             $search_body = json_decode(wp_remote_retrieve_body($search_resp), true);
             if (!empty($search_body['records'])) {
-                // Duplicate found — add a chatter note / task instead
                 $existing_id = $search_body['records'][0]['Id'];
                 $task_data = [
                     'Subject' => 'New web enquiry — ' . ($v_form_name ?: 'Form'),
@@ -1515,8 +1594,7 @@ function e2s2_send_to_salesforce($form_data, $log_id)
                     'Status' => 'Not Started',
                     'Priority' => 'Normal',
                 ];
-                $task_url = $instance_url . '/services/data/v59.0/sobjects/Task/';
-                $task_resp = wp_remote_post($task_url, [
+                $task_resp = wp_remote_post($instance_url . '/services/data/v59.0/sobjects/Task/', [
                     'timeout' => 15,
                     'headers' => [
                         'Authorization' => 'Bearer ' . $access_token,
@@ -1524,7 +1602,6 @@ function e2s2_send_to_salesforce($form_data, $log_id)
                     ],
                     'body' => json_encode($task_data),
                 ]);
-
                 $t_code = is_wp_error($task_resp) ? 0 : wp_remote_retrieve_response_code($task_resp);
                 $wpdb->update($table, [
                     'sf_status' => ($t_code === 201) ? 'success' : 'failed',
@@ -1535,7 +1612,6 @@ function e2s2_send_to_salesforce($form_data, $log_id)
         }
     }
 
-    // ── Build Lead payload ─────────────────────────────────────────────────────
     $lead_data = [
         'FirstName' => $first_name,
         'LastName' => $last_name,
@@ -1544,27 +1620,22 @@ function e2s2_send_to_salesforce($form_data, $log_id)
         'LeadSource' => 'Web',
         'Description' => $description,
         'Website' => $v_page_url,
-        // SF Lead requires Company — use course name or fallback
         'Company' => $v_course ?: 'Website Enquiry',
 
-        // ── Custom fields ──────────────────────────────────────────────────────
-        // CREATE these fields first in: Setup → Object Manager → Lead → Fields & Relationships
-        // Then uncomment the lines you need. API names MUST end with __c.
+        // ── Custom fields — uncomment ONLY after creating them in Salesforce ──
+        // Setup → Object Manager → Lead → Fields & Relationships → New
         // 'Course_Interested__c'      => $v_course,
-        // 'Date_of_Birth__c'          => $v_dob,         // Date field — ensure YYYY-MM-DD format
+        // 'Date_of_Birth__c'          => $v_dob,
         // 'Role_Applied__c'           => $v_role,
         // 'Qualification_Expected__c' => $v_qual,
-        // 'Placement_Required__c'     => $v_placement,   // Picklist: Yes / No
+        // 'Placement_Required__c'     => $v_placement,
         // 'Form_Name__c'              => $v_form_name,
         // 'Source_Page_URL__c'        => $v_page_url,
     ];
 
-    // Strip empty values — SF rejects empty strings on some field types
     $lead_data = array_filter($lead_data, fn($v) => $v !== '' && $v !== null);
 
-    // ── POST to Salesforce ─────────────────────────────────────────────────────
-    $api_url = $instance_url . '/services/data/v59.0/sobjects/Lead/';
-    $response = wp_remote_post($api_url, [
+    $response = wp_remote_post($instance_url . '/services/data/v59.0/sobjects/Lead/', [
         'method' => 'POST',
         'timeout' => 30,
         'headers' => [
@@ -1575,7 +1646,6 @@ function e2s2_send_to_salesforce($form_data, $log_id)
     ]);
 
     if (is_wp_error($response)) {
-        // Clear token cache — might be a stale token issue
         delete_option('e2s2_sf_access_token');
         $wpdb->update($table, [
             'sf_status' => 'failed',
@@ -1588,14 +1658,12 @@ function e2s2_send_to_salesforce($form_data, $log_id)
     $code = wp_remote_retrieve_response_code($response);
     $body_arr = json_decode($body, true);
 
-    // 401 = token expired mid-session — clear so next submission re-authenticates
     if ($code === 401) {
         delete_option('e2s2_sf_access_token');
     }
 
     $sf_lead_id = isset($body_arr['id']) ? $body_arr['id'] : '';
 
-    // HTTP 201 = Created successfully
     $wpdb->update($table, [
         'sf_status' => ($code === 201) ? 'success' : 'failed',
         'sf_response' => $sf_lead_id
